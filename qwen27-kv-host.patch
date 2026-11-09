@@ -1,0 +1,315 @@
+From 71ad5406d7a78eb13fafb64d6002fcdd44e38f89 Mon Sep 17 00:00:00 2001
+From: MaverickKB <kbandoly@synetron.com>
+Date: Sun, 8 Nov 2026 20:42:24 -0500
+Subject: [PATCH] qwen3_5: TF_QWEN_KV_HOST - pinned-host KV pages for
+ capacity-mode long windows
+
+---
+ zig/src/core/kv_pool.zig                      | 18 +++++++---
+ zig/src/core/profile.zig                      |  2 ++
+ zig/src/families/qwen3_5/cuda_kv_host.zig     | 28 +++++++++++++++
+ zig/src/families/qwen3_5/cuda_native.zig      | 11 ++++++
+ .../families/qwen3_5/cuda_native_explain.zig  |  1 +
+ zig/src/families/qwen3_5/cuda_pages.zig       | 35 +++++++++++++++----
+ zig/src/native/cuda_kv_pool.zig               |  9 ++---
+ zig/src/native/cuda_streams.zig               |  3 +-
+ 8 files changed, 91 insertions(+), 16 deletions(-)
+ create mode 100644 zig/src/families/qwen3_5/cuda_kv_host.zig
+
+diff --git a/zig/src/core/kv_pool.zig b/zig/src/core/kv_pool.zig
+index f3e4eaf..ab5e9d1 100644
+--- a/zig/src/core/kv_pool.zig
++++ b/zig/src/core/kv_pool.zig
+@@ -102,6 +102,9 @@ pub const Budget = struct {
+     slots_only: bool = false,
+     /// --prompt-cache-gib named the cache: it comes before every window but the engine's own, which take the rest.
+     asked: bool = false,
++    /// Bytes of host memory the pages fund themselves from (TF_QWEN_KV_HOST): the device room
++    /// charges no pages then, not even the engine's own, and `pages` counts from these bytes.
++    pages_room: u64 = 0,
+ };
+ 
+ /// The streams served, the cache's slots and copied-KV bytes, and the pages left for the streams.
+@@ -112,6 +115,7 @@ pub const Plan = struct {
+     pages: usize,
+     kept: u64 = 0, // the cache bytes made pages
+     taken: u64 = 0, // the cache bytes the windows past the engine's own took before it (0 when it was asked)
++    host: usize = 0, // the pages living in pinned host memory (0: every page on the card)
+ };
+ 
+ /// The prompt cache's split: slots for its snapshots, the rest for their copied KV rows (no slot: no cache).
+@@ -123,7 +127,8 @@ pub fn split(cache: u64, snap_bytes: u64, named: ?usize) struct { snaps: usize,
+ 
+ /// The pool as room - engine - (lanes - 1) x fixed - snaps x snap_bytes - copied, a page a stream beside it at least.
+ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
+-    const own = ownPages(l, b);
++    const host_funded = b.pages_room > 0;
++    const own = if (host_funded) 0 else ownPages(l, b);
+     if (b.engine + own > b.room or b.lanes == 0) return error.NoStream;
+     var left = b.room - b.engine - own;
+     const extra: u64 = b.lanes - 1;
+@@ -136,13 +141,17 @@ pub fn plan(l: Layout, b: Budget) error{ NoStream, TooMany }!Plan {
+     const kept = if (b.slots_only) cache - split(cache, l.snap_bytes, b.snaps).snaps * l.snap_bytes else cache / 1_000_000 * b.kept_ppm + cache % 1_000_000 * b.kept_ppm / 1_000_000; // the cache's share as pages
+     const c = split(cache - kept, l.snap_bytes, b.snaps);
+     left -= c.snaps * l.snap_bytes + c.copied;
+-    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * l.pages(b.window) + fit * l.runPages() + kept / l.pageBytes() else std.math.maxInt(u64);
+-    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = @intCast(@min((left + own) / l.pageBytes(), most)), .kept = kept, .taken = taken };
++    const most: u64 = if (b.window > 0) (fit + @intFromBool(b.engine_paged)) * (l.pages(b.window) + l.runPages()) + kept / l.pageBytes() else std.math.maxInt(u64);
++    const pages: usize = if (host_funded)
++        @intCast(@min(b.pages_room / l.pageBytes(), most))
++    else
++        @intCast(@min((left + own) / l.pageBytes(), most));
++    return .{ .lanes = @intCast(1 + fit), .snaps = c.snaps, .copied = c.copied, .pages = pages, .kept = kept, .taken = taken, .host = if (host_funded) pages else 0 };
+ }
+ 
+ /// Whether `b.cache` fits whole in what `plan` leaves it: the room past the engine and a fixed part and page a stream.
+ pub fn holds(l: Layout, b: Budget) bool {
+-    const own = ownPages(l, b);
++    const own = if (b.pages_room > 0) 0 else ownPages(l, b);
+     if (b.engine + own > b.room or b.lanes == 0) return false;
+     const left = b.room - b.engine - own;
+     const each = l.fixed_bytes + (1 + l.runPages()) * l.pageBytes();
+@@ -157,6 +166,7 @@ fn held(l: Layout, b: Budget, fit: u64, more: u64) u64 {
+ 
+ /// Windows set aside before the cache, the engine's own among them: as many as the room holds when its rows are pages.
+ fn windows(l: Layout, b: Budget) u64 {
++    if (b.pages_room > 0) return 1; // host pages: the engine's own window is not the device room's to hold
+     if (!b.engine_paged or b.window == 0 or b.asked) return 1; // an asked cache comes before all but the engine's own
+     const own = ownPages(l, b);
+     return @min(b.lanes, 1 + (b.room - own) / (own + l.fixed_bytes));
+diff --git a/zig/src/core/profile.zig b/zig/src/core/profile.zig
+index 4993cd1..6180931 100644
+--- a/zig/src/core/profile.zig
++++ b/zig/src/core/profile.zig
+@@ -7,6 +7,7 @@ pub const Switch = enum {
+     TF_QWEN_KV_PAGES,
+     TF_QWEN_KV_PAGES_ALL,
+     TF_QWEN_KV_SHARE,
++    TF_QWEN_KV_HOST,
+     TF_QWEN_REQUEST_STARTS,
+     TF_KV_SHARE,
+     TF_FLASHNEXT_KV_PAGES,
+@@ -125,6 +126,7 @@ pub const entries = [_]Entry{
+     .{ .id = .TF_QWEN_KV_PAGES, .families = qwen, .class = .identical, .effect = "KV pool page size; memory and workload tradeoffs", .evidence = "#1357" },
+     .{ .id = .TF_QWEN_KV_PAGES_ALL, .families = qwen, .class = .debug, .syntax = .one, .effect = "Put the engine's own stream on pages too", .evidence = "#1357" },
+     .{ .id = .TF_QWEN_KV_SHARE, .families = qwen, .class = .identical, .effect = "Keep prompt pages and bounded recurrent snapshots", .evidence = "#1357" },
++    .{ .id = .TF_QWEN_KV_HOST, .families = qwen, .class = .identical, .syntax = .one, .effect = "Keep the KV pool's pages in pinned host memory (capacity mode: decode pays PCIe a token)", .evidence = "RTX 5080 262144-token recipe, 2026-11-08" },
+     .{ .id = .TF_KV_SHARE, .families = &.{ "gemma4", "gemma4_unified", "kolibri1", "spark2_5", "glm5_next" }, .class = .identical, .effect = "Keep prompt states over the core KV pool", .evidence = "#1657" },
+     .{ .id = .TF_FLASHNEXT_KV_PAGES, .families = flash, .class = .experimental, .effect = "KV pool page size; fast-profile qualification pending", .evidence = "#1660" },
+     .{ .id = .TF_FLASHNEXT_KV_PAGES_ALL, .families = flash, .class = .debug, .syntax = .one, .effect = "Put every stream on pool pages for checks", .evidence = "#1660" },
+diff --git a/zig/src/families/qwen3_5/cuda_kv_host.zig b/zig/src/families/qwen3_5/cuda_kv_host.zig
+new file mode 100644
+index 0000000..42bf7e3
+--- /dev/null
++++ b/zig/src/families/qwen3_5/cuda_kv_host.zig
+@@ -0,0 +1,28 @@
++//! TF_QWEN_KV_HOST=1: the pool's KV pages (and runs) in pinned host memory, mapped into the
++//! device's address space (cuMemHostAlloc PORTABLE|DEVICEMAP, as GLM's host pages). Qwen3.8's
++//! full attention reads every position every token, so a host tier is a capacity mode, not a
++//! speed mode: decode pays one PCIe read of the window's KV a token, while prefill streams
++//! writes and stays compute-bound. The kernels are untouched: one page base, host or device.
++const std = @import("std");
++
++/// An exact-one switch through the profile registry, which is the one reader of a registered name.
++pub fn onHost() bool {
++    const v = @import("profile").get(.TF_QWEN_KV_HOST) orelse return false;
++    return std.mem.eql(u8, v, "1");
++}
++
++/// TF_QWEN_KV_HOST_GIB=n caps the host pages; unset: a full window's worth plus its run.
++pub fn hostGib() ?u64 {
++    const v = std.c.getenv("TF_QWEN_KV_HOST_GIB") orelse return null;
++    const n = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return null;
++    return if (n == 0) null else n << 30;
++}
++
++/// Host bytes the pool's pages need: a full window's pages plus its run, or the _GIB cap.
++pub fn hostBytes(capacity: usize, tokens: usize, page_bytes: u64, run_bytes: u64) u64 {
++    const t: usize = @intCast(tokens);
++    const window_pages = (capacity + t - 1) / t;
++    const run_pages = (run_bytes + page_bytes - 1) / page_bytes;
++    const all = (window_pages + run_pages) * page_bytes;
++    return @min(all, hostGib() orelse all);
++}
+diff --git a/zig/src/families/qwen3_5/cuda_native.zig b/zig/src/families/qwen3_5/cuda_native.zig
+index 9a7f050..efe164b 100644
+--- a/zig/src/families/qwen3_5/cuda_native.zig
++++ b/zig/src/families/qwen3_5/cuda_native.zig
+@@ -19,6 +19,7 @@ const Fill = prefill.Fill;
+ const reuse = @import("cuda_reuse.zig");
+ const Mtp = @import("cuda_mtp.zig").Mtp;
+ const pages_mod = @import("cuda_pages.zig");
++const kv_host_mod = @import("cuda_kv_host.zig");
+ const cache_mod = @import("cuda_cache.zig");
+ const prefix_mod = @import("cuda_prefix.zig");
+ const kv_pool = @import("core").kv_pool;
+@@ -134,6 +135,14 @@ pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
+     if (l.prefix != null and prefix_mod.fewSnapshots(l.share_snaps, streams + 1)) std.log.warn("TF_QWEN_KV_SHARE={d} keeps under 4 recurrent-state snapshots a stream at --parallel {d}: live streams evict each other's before a resume; set it to {d} or more", .{ l.share_snaps, streams + 1, 4 * (streams + 1) });
+ }
+ 
++/// Host bytes the pool's pages need under TF_QWEN_KV_HOST (0: off or unpaged); the plan funds them there.
++pub fn kvHostRoom(p: *anyopaque) u64 {
++    const l: *Lanes = @ptrCast(@alignCast(p));
++    if (l.page_tokens == 0) return 0;
++    const pl = pages_mod.layout(l.e, l.capacity, l.page_tokens, l.ringBytes(), l.extra);
++    return kv_host_mod.hostBytes(l.capacity, l.page_tokens, pl.pageBytes(), pl.run_bytes);
++}
++
+ /// The lane host's admission: the first stream's window is free, or a lane and the request's pages are.
+ pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
+     const l: *Lanes = @ptrCast(@alignCast(p));
+@@ -175,9 +184,11 @@ pub fn openLanes(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, d
+     const page_test = try cache_mod.pageTest();
+     _ = try cache_mod.cacheRows(o.context, page_test);
+     if (page_tokens > 0 and o.slide) return error.QwenPagesNoLearner;
++    if (kv_host_mod.onHost() and page_tokens == 0) return error.QwenKvHostNeedsPages;
+     const share_snaps = try prefix_mod.sharing();
+     // a kept state sits on a cold pass's chunk cut, so later chunks keep a cold pass's bits: pages divide the chunk
+     if (share_snaps > 0 and (page_tokens == 0 or E.max_rows % page_tokens != 0)) return error.QwenShareNeedsPages;
++    if (kv_host_mod.onHost() and share_snaps == 0) std.log.warn("TF_QWEN_KV_HOST pins the KV pages in host memory; the prompt cache would pin more beside them: set --prompt-cache-gib (or TF_QWEN_KV_SHARE) to bound it", .{});
+     const e = try E.Engine.init(gpa, io, ctx, dir, o.kv8, fitOf(o));
+     errdefer e.deinit();
+     if (o.rope_yarn) |f| { // --rope-yarn over the downloaded config: its table, and the window it allows
+diff --git a/zig/src/families/qwen3_5/cuda_native_explain.zig b/zig/src/families/qwen3_5/cuda_native_explain.zig
+index 8d18ec1..fe0b608 100644
+--- a/zig/src/families/qwen3_5/cuda_native_explain.zig
++++ b/zig/src/families/qwen3_5/cuda_native_explain.zig
+@@ -12,6 +12,7 @@ pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadQwenKvShare => "TF_QWEN_KV_SHARE takes the most recurrent-state snapshots the prompt cache keeps (0 or unset: off)",
+         error.QwenYarnNoLearner => "--slide: the learner's attention ropes without YaRN; serve without --slide, or without --rope-yarn and a YaRN config",
+         error.BadQwenKvPages => "TF_QWEN_KV_PAGES takes the positions a page holds (a whole number; 0 or unset: a window each)",
++        error.QwenKvHostNeedsPages => "TF_QWEN_KV_HOST keeps the KV pages in pinned host memory: set TF_QWEN_KV_PAGES (with TF_QWEN_KV_PAGES_ALL=1 for a single stream) so there are pages to place",
+         error.UnsupportedQwenVision => "--vision: this checkpoint's image tower or text M-RoPE is not one the CUDA engine reads",
+         else => null,
+     };
+diff --git a/zig/src/families/qwen3_5/cuda_pages.zig b/zig/src/families/qwen3_5/cuda_pages.zig
+index 9a433a0..2c17168 100644
+--- a/zig/src/families/qwen3_5/cuda_pages.zig
++++ b/zig/src/families/qwen3_5/cuda_pages.zig
+@@ -4,6 +4,7 @@ const cuda = @import("cuda");
+ const kv = @import("core").kv_pool;
+ const engine = @import("cuda_engine.zig");
+ const caches = @import("cuda_cache.zig");
++const kv_host = @import("cuda_kv_host.zig");
+ 
+ const Engine = engine.Engine;
+ const Cache = caches.Cache;
+@@ -58,7 +59,12 @@ pub const Pages = struct {
+     capacity: usize,
+     ring: usize,
+     pool: kv.Pool,
++    /// The pool's one arena: device pages by default, pinned host pages under TF_QWEN_KV_HOST
++    /// (one base either way, so the kernels are untouched; the runs share the arena as before).
+     arena: cuda.DeviceBuffer,
++    host: ?cuda.HostBuffer = null,
++    /// The arena's device address: `arena.ptr`, or the mapped host pointer when host-funded.
++    base: u64 = 0,
+     lanes: []Lane,
+ 
+     /// `streams` lanes and `pages` pages of layout `l`, made and touched now; each run holds a `ring`-byte ring.
+@@ -71,9 +77,20 @@ pub const Pages = struct {
+         _ = try std.math.add(u64, l.run_bytes, page_bytes - 1);
+         const p = try gpa.create(Pages);
+         errdefer gpa.destroy(p);
+-        var arena = try cuda.DeviceBuffer.alloc(e.d, try std.math.mul(usize, pages, page_bytes));
+-        errdefer arena.free();
+-        p.* = .{ .gpa = gpa, .e = e, .layout = l, .capacity = capacity, .ring = ring, .pool = try kv.Pool.init(gpa, pages, page_bytes), .arena = arena, .lanes = &.{} };
++        const total = try std.math.mul(usize, pages, page_bytes);
++        var host: ?cuda.HostBuffer = null;
++        var arena = cuda.DeviceBuffer{ .d = e.d, .ptr = 0, .len = 0 };
++        var base: u64 = 0;
++        if (kv_host.onHost()) {
++            host = try cuda.HostBuffer.allocMapped(e.d, total);
++            base = try host.?.device();
++        } else {
++            arena = try cuda.DeviceBuffer.alloc(e.d, total);
++            base = arena.ptr;
++        }
++        errdefer if (host != null) host.?.free();
++        errdefer if (host == null) arena.free();
++        p.* = .{ .gpa = gpa, .e = e, .layout = l, .capacity = capacity, .ring = ring, .pool = try kv.Pool.init(gpa, pages, page_bytes), .arena = arena, .host = host, .base = base, .lanes = &.{} };
+         errdefer p.pool.deinit();
+         p.lanes = try gpa.alloc(Lane, streams);
+         errdefer gpa.free(p.lanes);
+@@ -85,12 +102,16 @@ pub const Pages = struct {
+         for (p.lanes) |*x| {
+             const c = try gpa.create(Cache);
+             errdefer gpa.destroy(c);
+-            c.* = try Cache.initPaged(gpa, e, mostPages(capacity, tokens), tokens, arena.ptr);
++            c.* = try Cache.initPaged(gpa, e, mostPages(capacity, tokens), tokens, base);
+             x.* = .{ .cache = c };
+             made += 1;
+         }
+         errdefer cuda.completion.drain(e.d, e.stream, "qwen3_5: a failed pool initialization did not drain");
+-        try arena.fill8(0, e.stream.handle);
++        if (host) |h| {
++            // The host pages zero through the device's view of them, on the engine's stream like every fill.
++            const view = cuda.DeviceBuffer{ .d = e.d, .ptr = p.base, .len = h.bytes.len, .borrowed = true };
++            try view.fill8(0, e.stream.handle);
++        } else try arena.fill8(0, e.stream.handle);
+         for (p.lanes) |x| try x.cache.paged.?.table.fill8(0, e.stream.handle);
+         try e.stream.synchronize();
+         return p;
+@@ -107,7 +128,7 @@ pub const Pages = struct {
+             p.gpa.destroy(x.cache);
+         }
+         p.gpa.free(p.lanes);
+-        p.arena.free();
++        if (p.host != null) p.host.?.free() else p.arena.free();
+         p.pool.deinit();
+         p.gpa.destroy(p);
+     }
+@@ -152,7 +173,7 @@ pub const Pages = struct {
+         var up: Upload = .{ .p = p, .cache = x.cache };
+         if (adopted.len > 0) try Upload.write(&up, x.lease.ids.items, 0);
+         try p.pool.cover(&x.lease, n, .{ .ctx = &up, .write = Upload.write });
+-        try x.cache.mapRun(p.e, p.arena.ptr + run * p.layout.pageBytes(), k * p.layout.pageBytes(), p.ring);
++        try x.cache.mapRun(p.e, p.base + run * p.layout.pageBytes(), k * p.layout.pageBytes(), p.ring);
+         try x.cache.reset(p.e);
+         x.cache.paged.?.ids = x.lease.ids.items;
+         x.cache.cap = n * p.layout.page_tokens;
+diff --git a/zig/src/native/cuda_kv_pool.zig b/zig/src/native/cuda_kv_pool.zig
+index 65b0644..b71e552 100644
+--- a/zig/src/native/cuda_kv_pool.zig
++++ b/zig/src/native/cuda_kv_pool.zig
+@@ -146,18 +146,19 @@ pub fn placeHost(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, a
+ fn fits(comptime F: type, loaded: anytype, o: api.Open, room: u64, window: u64, stream_bytes: u64) bool {
+     const want = budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
+     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
+-    if (layout(loaded)) |l| return kv_pool.holds(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = enginePaged(loaded), .asked = o.prompt_cache_gib != null });
++    const kv_host: u64 = if (comptime @hasDecl(F, "kvHostRoom")) F.kvHostRoom(loaded.ctx) else 0;
++    if (layout(loaded)) |l| return kv_pool.holds(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = named(o), .window = window + rows, .engine_paged = enginePaged(loaded), .asked = o.prompt_cache_gib != null, .pages_room = kv_host });
+     const n = budget.admit(room, stream_bytes, loaded.free_streams, o.lanes, o.lanes_fixed) catch return false;
+     return room -| stream_bytes * (n -| loaded.free_streams) >= want;
+ }
+ 
+ /// The pool beside the engine's own sequence (in `model`: a window, or on pages its fixed part); null: see `problem`.
+-pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, kept_ppm: u32, slots: ?usize) !?Plan {
++pub fn plan(comptime F: type, a: Allocator, l: kv_pool.Layout, room: u64, o: api.Open, window: u64, problem: *[]const u8, host_mode: bool, engine_paged: bool, kept_ppm: u32, slots: ?usize, kv_host: u64) !?Plan {
+     const rows: u64 = if (comptime @hasDecl(F, "window_rows")) F.window_rows else 0;
+     const want = if (host_mode) 0 else budget.cacheBytes(o.prompt_cache_gib, std.math.maxInt(u64), 0);
+-    return kv_pool.plan(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = slots orelse named(o), .window = window + rows, .engine_paged = engine_paged, .kept_ppm = if (host_mode) 0 else kept_ppm, .slots_only = slots != null, .asked = o.prompt_cache_gib != null }) catch |e| {
++    return kv_pool.plan(l, .{ .room = room, .engine = 0, .lanes = o.lanes, .fixed = o.lanes_fixed, .cache = want, .snaps = slots orelse named(o), .window = window + rows, .engine_paged = engine_paged, .kept_ppm = if (host_mode) 0 else kept_ppm, .slots_only = slots != null, .asked = o.prompt_cache_gib != null, .pages_room = kv_host }) catch |e| {
+         problem.* = switch (e) {
+-            error.NoStream => if (engine_paged) try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream beside the model: one at a {d}-token window takes {d:.2} GiB of KV pages, and the budget leaves {d:.2} GiB", .{ window, toGib(l.pages(window + rows) * l.pageBytes()), toGib(room) }) else "the CUDA memory budget fits no stream beside the model",
++            error.NoStream => if (engine_paged) try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream beside the model: one at a {d}-token window takes {d:.2} GiB of KV pages{s}, and the budget leaves {d:.2} GiB", .{ window, toGib(l.pages(window + rows) * l.pageBytes()), if (kv_host > 0) " (host-funded)" else "", toGib(room) }) else "the CUDA memory budget fits no stream beside the model",
+             error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its other streams' fixed parts, state runs and a page each, and the CUDA memory budget leaves {d:.2} GiB: serve fewer, or free device memory", .{ o.lanes, toGib((o.lanes - 1) * (l.fixed_bytes + (1 + l.runPages()) * l.pageBytes())), toGib(room) }),
+         };
+         return null;
+diff --git a/zig/src/native/cuda_streams.zig b/zig/src/native/cuda_streams.zig
+index c973376..825cf02 100644
+--- a/zig/src/native/cuda_streams.zig
++++ b/zig/src/native/cuda_streams.zig
+@@ -54,7 +54,8 @@ pub fn count(comptime F: type, a: Allocator, loaded: anytype, o: api.Open, b: Bu
+     const wrapped = kv_pages.wrapped(F, loaded, free, b.stream_bytes, b.room);
+     if (wrapped.layout) |l| {
+         const slots = try shareSlots(b.share, l.snap_bytes, b.host_cache); // GLM: a slot a state
+-        const paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(b.window), problem, b.host_cache, kv_pages.enginePaged(loaded), keptPpm(F, b.share), slots) orelse return null;
++        const kv_host: u64 = if (comptime @hasDecl(F, "kvHostRoom")) F.kvHostRoom(loaded.ctx) else 0;
++        const paged = try kv_pages.plan(F, a, l, wrapped.room, o, @intCast(b.window), problem, b.host_cache, kv_pages.enginePaged(loaded), keptPpm(F, b.share), slots, kv_host) orelse return null;
+         return .{ .streams = paged.lanes, .paged = paged, .layout = l, .slots = slots };
+     }
+     // --parallel caps the streams; each request reserves its own bytes (a family that allocates per request)
+-- 
+2.43.0
+
